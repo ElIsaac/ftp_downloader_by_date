@@ -11,6 +11,7 @@ español, confirmación antes de cada acción que toma tiempo.
 
 import locale
 import posixpath
+import queue
 import socket
 import stat as stat_mod
 import sys
@@ -18,9 +19,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 import paramiko
 from dotenv import dotenv_values
@@ -79,7 +80,24 @@ class RemoteEntry:
 
 @dataclass(frozen=True, slots=True)
 class DateFilter:
-    target_date: date
+    start_date: date
+    end_date: date
+
+    @property
+    def is_single_day(self) -> bool:
+        return self.start_date == self.end_date
+
+    def describe(self) -> str:
+        s = self.start_date.strftime("%d-%m-%Y")
+        if self.is_single_day:
+            return s
+        return f"{s} al {self.end_date.strftime('%d-%m-%Y')}"
+
+    def folder_name(self) -> str:
+        s = self.start_date.strftime("%d-%m-%Y")
+        if self.is_single_day:
+            return s
+        return f"{s}_al_{self.end_date.strftime('%d-%m-%Y')}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,7 +189,7 @@ class ErrorTranslator:
                     "Revisa tu conexión o aumenta CONNECT_TIMEOUT en .env."
                 )
             case PermissionError():
-                return "No tienes permiso de escribir en la carpeta de destino."
+                return "Permiso denegado."
             case FileNotFoundError():
                 return "La ruta indicada no existe en el servidor."
             case SSHException():
@@ -334,30 +352,6 @@ class RemoteListingService:
     def list_dir(self, path: str) -> list[RemoteEntry]:
         return [self._to_entry(a, path) for a in self._client.listdir_attr(path)]
 
-    def walk(
-        self, path: str, errors: list[str] | None = None
-    ) -> Iterator[RemoteEntry]:
-        """Recorre `path` recursivamente.
-
-        Si `errors` se proporciona, los subdirectorios que no se pudieron leer
-        (típicamente PermissionError) se acumulan ahí para que el caller pueda
-        avisar al usuario.
-        """
-        stack = [path]
-        while stack:
-            current = stack.pop()
-            try:
-                attrs_list = self._client.listdir_attr(current)
-            except OSError:
-                if errors is not None:
-                    errors.append(current)
-                continue
-            for attr in attrs_list:
-                entry = self._to_entry(attr, current)
-                yield entry
-                if entry.is_dir:
-                    stack.append(entry.full_path)
-
     def validate_path(self, path: str) -> bool:
         try:
             attrs = self._client.stat(path)
@@ -382,6 +376,131 @@ class RemoteListingService:
         return mode is not None and stat_mod.S_ISDIR(mode)
 
 
+class ParallelRemoteWalker:
+    """Recorre un árbol SFTP usando varios canales en paralelo.
+
+    Cada worker abre su propio canal SFTP sobre el mismo Transport y procesa
+    directorios en paralelo. Mientras el walk típico (un canal) hace N
+    round-trips serializados para N carpetas, este hace ~N/W con W workers.
+    """
+
+    def __init__(self, connection: SFTPConnectionService, max_workers: int):
+        self._connection = connection
+        self._max_workers = max(1, max_workers)
+        self.pruned_count = 0
+
+    def walk(
+        self,
+        root: str,
+        errors: list[str] | None = None,
+        prune: Callable[[RemoteEntry], bool] | None = None,
+    ) -> Iterator[RemoteEntry]:
+        # Abrir todos los canales al inicio. Si el servidor limita sesiones,
+        # caemos a la cantidad que sí pudo abrir (al menos 1).
+        clients: list[SFTPClient] = []
+        for _ in range(self._max_workers):
+            try:
+                clients.append(self._connection.open_thread_client())
+            except Exception:
+                if not clients:
+                    raise
+                break
+        n_workers = len(clients)
+
+        dirs_q: queue.Queue = queue.Queue()
+        results_q: queue.Queue = queue.Queue()
+        dirs_q.put(root)
+        pending = [1]
+        lock = threading.Lock()
+        self.pruned_count = 0
+
+        def to_entry(attr: SFTPAttributes, parent: str) -> RemoteEntry:
+            full_path = posixpath.join(parent, attr.filename)
+            if full_path.startswith("./"):
+                full_path = full_path[2:]
+            is_dir = attr.st_mode is not None and stat_mod.S_ISDIR(attr.st_mode)
+            return RemoteEntry(
+                name=attr.filename,
+                full_path=full_path,
+                is_dir=is_dir,
+                size_bytes=attr.st_size or 0,
+                modified_at=datetime.fromtimestamp(attr.st_mtime or 0),
+            )
+
+        def worker(client: SFTPClient) -> None:
+            try:
+                while True:
+                    current = dirs_q.get()
+                    if current is None:
+                        return
+                    new_dirs: list[str] = []
+                    local_pruned = 0
+                    try:
+                        attrs_list = client.listdir_attr(current)
+                    except OSError:
+                        results_q.put(("error", current))
+                    else:
+                        batch: list[RemoteEntry] = []
+                        for attr in attrs_list:
+                            entry = to_entry(attr, current)
+                            if entry.is_dir and prune is not None and prune(entry):
+                                local_pruned += 1
+                                continue
+                            batch.append(entry)
+                            if entry.is_dir:
+                                new_dirs.append(entry.full_path)
+                        if batch:
+                            results_q.put(("entries", batch))
+
+                    with lock:
+                        if local_pruned:
+                            self.pruned_count += local_pruned
+                        pending[0] += len(new_dirs) - 1
+                        all_done = pending[0] == 0
+                    for d in new_dirs:
+                        dirs_q.put(d)
+                    if all_done:
+                        for _ in range(n_workers):
+                            dirs_q.put(None)
+                        results_q.put(("done", None))
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+        threads = [
+            threading.Thread(target=worker, args=(c,), daemon=True)
+            for c in clients
+        ]
+        for t in threads:
+            t.start()
+
+        try:
+            while True:
+                kind, payload = results_q.get()
+                if kind == "entries":
+                    yield from payload
+                elif kind == "error":
+                    if errors is not None:
+                        errors.append(payload)
+                elif kind == "done":
+                    # Drenar lo que quede en la cola
+                    while True:
+                        try:
+                            kind2, payload2 = results_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if kind2 == "entries":
+                            yield from payload2
+                        elif kind2 == "error" and errors is not None:
+                            errors.append(payload2)
+                    break
+        finally:
+            for t in threads:
+                t.join(timeout=2.0)
+
+
 class DateParser:
     @staticmethod
     def parse(raw: str) -> date:
@@ -398,7 +517,10 @@ class DateFilterService:
         return [
             e
             for e in entries
-            if not e.is_dir and e.modified_at.date() == date_filter.target_date
+            if not e.is_dir
+            and date_filter.start_date
+            <= e.modified_at.date()
+            <= date_filter.end_date
         ]
 
 
@@ -454,30 +576,73 @@ class ConsoleRenderer:
     def info(self, msg: str) -> None:
         self.console.print(f"  {msg}")
 
-    def listing_table(self, entries: list[RemoteEntry], max_rows: int = 30) -> None:
-        table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
-        table.add_column("Tipo", width=6)
-        table.add_column("Nombre", overflow="fold")
-        table.add_column("Modificado", width=12)
+    def navigation_view(
+        self,
+        current_path: str,
+        entries: list[RemoteEntry],
+        can_go_up: bool,
+    ) -> str:
+        self.console.print()
+        display = "/" if current_path == "." else current_path
+        self.console.print(f"Estás en: [bold cyan]{display}[/]")
+        self.console.print()
 
-        sorted_entries = sorted(
-            entries, key=lambda x: (not x.is_dir, x.name.lower())
+        if not entries:
+            self.console.print("  [dim](carpeta vacía)[/]")
+        else:
+            for e in entries:
+                date_str = e.modified_at.strftime("%d-%m-%Y")
+                if e.is_dir:
+                    self.console.print(
+                        f"  📁  {e.name}  [dim]· {date_str}[/]"
+                    )
+                else:
+                    self.console.print(
+                        f"  📄  {e.name}"
+                        f"  [dim]· {date_str} · "
+                        f"{format_bytes(e.size_bytes)}[/]"
+                    )
+
+        self.console.print()
+        self.console.print(
+            "[dim]Acciones:[/]\n"
+            "  [dim]· <nombre carpeta> + Enter      →  entrar a esa carpeta[/]\n"
+            "  [dim]· <ruta/sub/sub> + Enter        →  "
+            "navegar directo (relativa o absoluta con /)[/]\n"
+            + (
+                "  [dim]· .. + Enter                    →  "
+                "subir un nivel[/]\n"
+                if can_go_up
+                else ""
+            )
+            + "  [dim]· d + Enter                     →  "
+            "descargar esta carpeta (con confirmación)[/]"
         )
-        shown = sorted_entries[:max_rows]
-        for e in shown:
-            icon = "📁" if e.is_dir else "📄"
-            table.add_row(icon, e.name, e.modified_at.strftime("%d-%m-%Y"))
-        self.console.print(table)
-        remaining = len(sorted_entries) - len(shown)
-        if remaining > 0:
-            self.console.print(f"  [dim]… y {remaining} más[/]")
+        raw = Prompt.ask(
+            "[bold cyan]>[/]",
+            console=self.console,
+            default="",
+            show_default=False,
+        )
+        return raw.strip()
 
-    def preview_panel(self, plan: DownloadPlan, target_date: date) -> None:
-        fecha_human = format_date_human(target_date)
+    def preview_panel(self, plan: DownloadPlan, date_filter: DateFilter) -> None:
+        if date_filter.is_single_day:
+            fecha_human = format_date_human(date_filter.start_date)
+            fecha_line = (
+                f"  Fecha:           [bold]"
+                f"{date_filter.start_date.strftime('%d-%m-%Y')}[/]\n"
+                f"                   [dim]({fecha_human})[/]\n\n"
+            )
+        else:
+            fecha_line = (
+                f"  Rango fechas:    [bold]"
+                f"{date_filter.start_date.strftime('%d-%m-%Y')}[/]  al  "
+                f"[bold]{date_filter.end_date.strftime('%d-%m-%Y')}[/]\n\n"
+            )
         body = (
             f"  Carpeta origen:  [bold]{plan.remote_root}[/]\n"
-            f"  Fecha:           [bold]{target_date.strftime('%d-%m-%Y')}[/]\n"
-            f"                   [dim]({fecha_human})[/]\n\n"
+            f"{fecha_line}"
             f"  Archivos:        [bold]{len(plan.entries)}[/]\n"
             f"  Tamaño total:    [bold]{format_bytes(plan.total_bytes)}[/]\n\n"
             f"  Destino local:\n"
@@ -510,7 +675,12 @@ class ConsoleRenderer:
             console=self.console,
         )
 
-    def summary_panel(self, summary: DownloadSummary, destination: Path) -> None:
+    def summary_panel(
+        self,
+        summary: DownloadSummary,
+        destination: Path,
+        walk_errors: list[str] | None = None,
+    ) -> None:
         ok_color = "green" if summary.failures == 0 else "yellow"
         speed_mbs = (
             (summary.total_bytes / max(summary.duration_sec, 0.001)) / 1024 / 1024
@@ -542,6 +712,14 @@ class ConsoleRenderer:
                     self.console.print(
                         f"  • {r.entry.full_path}  [red]{r.error}[/]"
                     )
+
+        if walk_errors:
+            self.console.print(
+                "\n[bold yellow]Carpetas inaccesibles "
+                "(no se exploraron, sus archivos no se descargaron):[/]"
+            )
+            for p in walk_errors:
+                self.console.print(f"  • {p}")
 
         self.console.print()
         try:
@@ -584,48 +762,174 @@ class UserPromptService:
         self._renderer = renderer
         self._listing = listing_service
 
-    def ask_relative_path(self) -> str:
-        c = self._renderer.console
-        c.print("Escribe la ruta de la carpeta cuyo contenido")
-        c.print("quieres descargar. Puedes usar subcarpetas.")
-        c.print()
-        c.print("  [dim]Ejemplos:  facturas[/]")
-        c.print("  [dim]           facturas/2026[/]")
-        c.print("  [dim]           reportes/mensuales/mayo[/]")
-        c.print()
+    def navigate_to_folder(self) -> str:
+        """Navegación interactiva. Sólo lista la carpeta actual (no recursivo).
+
+        Retorna el path remoto de la carpeta que el usuario eligió descargar,
+        o "." si eligió la raíz.
+        """
+        current = "."
 
         while True:
-            raw = self._renderer.prompt("Ruta")
-            normalized = raw.strip().strip("/").replace("\\", "/")
-            if not normalized:
+            try:
+                entries = self._listing.list_dir(current)
+            except PermissionError:
                 self._renderer.error(
-                    "La ruta no puede estar vacía.",
-                    "Escribe el nombre de una carpeta como aparece en la lista de arriba.",
+                    f"No tienes permiso para ver el contenido de "
+                    f"'{current}' en el servidor.",
+                    "Vuelvo a la carpeta anterior.",
                 )
+                if current == ".":
+                    raise
+                current = posixpath.dirname(current.rstrip("/")) or "."
                 continue
-            if self._listing.validate_path(normalized):
-                return normalized
-            self._renderer.error(
-                f'La carpeta "{normalized}" no existe en el servidor.',
-                "Revisa que esté escrita exactamente como en el listado e inténtalo de nuevo.",
+            except (IOError, OSError) as e:
+                self._renderer.error(
+                    f"No se pudo leer '{current}' del servidor.",
+                    ErrorTranslator.translate(e),
+                )
+                if current == ".":
+                    raise
+                current = posixpath.dirname(current.rstrip("/")) or "."
+                continue
+
+            sorted_entries = sorted(
+                entries, key=lambda x: (not x.is_dir, x.name.lower())
             )
 
-    def ask_target_date(self) -> DateFilter:
+            choice = self._renderer.navigation_view(
+                current, sorted_entries, can_go_up=(current != ".")
+            )
+
+            if choice == "" or choice.lower() in ("d", "descargar"):
+                has_files = any(not e.is_dir for e in sorted_entries)
+                has_subdirs = any(e.is_dir for e in sorted_entries)
+                if not has_files and not has_subdirs:
+                    self._renderer.error(
+                        "Esta carpeta está vacía, no hay nada que descargar."
+                    )
+                    continue
+                display = "/" if current == "." else current
+                self._renderer.console.print()
+                self._renderer.console.print(
+                    f"Has elegido la carpeta: [bold cyan]{display}[/]"
+                )
+                self._renderer.console.print(
+                    "A continuación te preguntaré el [bold]rango de fechas[/] "
+                    "de los archivos a descargar."
+                )
+                if current == ".":
+                    self._renderer.warning(
+                        "Estás eligiendo la RAÍZ del servidor "
+                        "(la descarga podría ser muy grande)."
+                    )
+                if not self._renderer.confirm(
+                    "¿Es ésta la carpeta correcta?",
+                    default=True,
+                ):
+                    self._renderer.console.print(
+                        "[dim]Sigues navegando.[/]"
+                    )
+                    continue
+                return current
+
+            if choice == "..":
+                if current == ".":
+                    self._renderer.error("Ya estás en la raíz.")
+                    continue
+                current = posixpath.dirname(current.rstrip("/")) or "."
+                continue
+
+            if "/" in choice:
+                if choice.startswith("/"):
+                    target = posixpath.normpath(choice.lstrip("/"))
+                elif current == ".":
+                    target = posixpath.normpath(choice)
+                else:
+                    target = posixpath.normpath(
+                        posixpath.join(current, choice)
+                    )
+                if target in ("", "."):
+                    current = "."
+                    continue
+                if target.startswith(".."):
+                    self._renderer.error(
+                        f"La ruta '{choice}' sale del servidor.",
+                        "Usa una ruta dentro del servidor.",
+                    )
+                    continue
+                if not self._listing.validate_path(target):
+                    self._renderer.error(
+                        f"La ruta '{choice}' no existe o no es una carpeta.",
+                        "Recuerda que distingue mayúsculas y minúsculas.",
+                    )
+                    continue
+                current = target
+                continue
+
+            matched = next(
+                (e for e in sorted_entries if e.name == choice), None
+            )
+            if matched is None:
+                self._renderer.error(
+                    f"'{choice}' no existe en esta carpeta.",
+                    "Escribe el nombre EXACTO, una ruta como "
+                    "'carpeta/subcarpeta', '..' para subir, "
+                    "o 'd' para descargar esta carpeta.",
+                )
+                continue
+
+            if not matched.is_dir:
+                self._renderer.error(
+                    "Sólo puedes entrar a carpetas, no a archivos.",
+                    "Para descargar, escribe 'd' cuando estés en la carpeta deseada.",
+                )
+                continue
+
+            current = matched.full_path
+
+    def ask_date_range(self) -> DateFilter:
         c = self._renderer.console
+        c.print(
+            "Necesito un [bold]rango de fechas[/] (inclusivo en ambos extremos)."
+        )
         c.print("Formato: [bold]DD-MM-AAAA[/]  (día-mes-año, con guiones)")
         c.print("[dim]Ejemplo: 15-05-2026[/]")
+        c.print(
+            "[dim]Tip: si quieres un solo día, escribe la misma fecha en "
+            "inicio y fin.[/]"
+        )
         c.print()
 
         while True:
-            raw = self._renderer.prompt("Fecha")
+            raw = self._renderer.prompt("Fecha de inicio")
             try:
-                parsed = DateParser.parse(raw)
-                return DateFilter(target_date=parsed)
+                start = DateParser.parse(raw)
+                break
             except ValueError:
                 self._renderer.error(
                     "Formato incorrecto. Necesito DD-MM-AAAA.",
                     "Ejemplo válido: 15-05-2026. Inténtalo otra vez.",
                 )
+
+        while True:
+            raw = self._renderer.prompt("Fecha de fin")
+            try:
+                end = DateParser.parse(raw)
+            except ValueError:
+                self._renderer.error(
+                    "Formato incorrecto. Necesito DD-MM-AAAA.",
+                    "Ejemplo válido: 15-05-2026. Inténtalo otra vez.",
+                )
+                continue
+            if end < start:
+                self._renderer.error(
+                    "La fecha de fin es anterior a la de inicio.",
+                    f"Inicio: {start.strftime('%d-%m-%Y')}. "
+                    "Escribe una fecha igual o posterior.",
+                )
+                continue
+            return DateFilter(start_date=start, end_date=end)
 
     def confirm(self, message: str, default: bool = True) -> bool:
         return self._renderer.confirm(message, default=default)
@@ -755,6 +1059,78 @@ class DownloadService:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _yyyymmdd_prune_predicate(
+    date_filter: DateFilter, margin_days: int = 1
+) -> Callable[[RemoteEntry], bool]:
+    """Predicado que poda carpetas cuyo nombre `YYYYMMDD` cae fuera del rango.
+
+    El margen de ±N días absorbe el desfase típico entre el nombre de la
+    carpeta y el mtime de los archivos dentro (observado: +1 día).
+    """
+    lo = date_filter.start_date - timedelta(days=margin_days)
+    hi = date_filter.end_date + timedelta(days=margin_days)
+
+    def prune(entry: RemoteEntry) -> bool:
+        name = entry.name
+        if len(name) != 8 or not name.isdigit():
+            return False
+        try:
+            folder_date = datetime.strptime(name, "%Y%m%d").date()
+        except ValueError:
+            return False
+        return folder_date < lo or folder_date > hi
+
+    return prune
+
+
+def _walk_filter_with_progress(
+    walker: "ParallelRemoteWalker",
+    remote_root: str,
+    date_filter: DateFilter,
+    renderer: "ConsoleRenderer",
+    errors: list[str],
+) -> list[RemoteEntry]:
+    """Recorre `remote_root` en paralelo, podando subárboles fuera del rango.
+
+    Muestra un spinner con el conteo de carpetas exploradas, podadas y
+    archivos coincidentes.
+    """
+    matched: list[RemoteEntry] = []
+    dirs_explored = 0
+    range_str = date_filter.describe()
+    start = date_filter.start_date
+    end = date_filter.end_date
+    prune = _yyyymmdd_prune_predicate(date_filter)
+
+    def status_text() -> str:
+        pruned = walker.pruned_count
+        extra = f", {pruned} podadas" if pruned else ""
+        return (
+            f"[cyan]Buscando archivos del {range_str}...[/] "
+            f"[dim]({dirs_explored} carpetas{extra}, "
+            f"{len(matched)} coincidencias)[/]"
+        )
+
+    with renderer.console.status(
+        f"[cyan]Buscando archivos del {range_str}...[/]", spinner="dots"
+    ) as status:
+        for entry in walker.walk(remote_root, errors=errors, prune=prune):
+            if entry.is_dir:
+                dirs_explored += 1
+                status.update(status_text())
+            elif start <= entry.modified_at.date() <= end:
+                matched.append(entry)
+                status.update(status_text())
+
+    pruned_total = walker.pruned_count
+    pruned_msg = f", {pruned_total} podada(s) por nombre" if pruned_total else ""
+    renderer.success(
+        f"Exploración terminada: {dirs_explored} carpeta(s){pruned_msg}, "
+        f"{len(matched)} archivo(s) del {range_str}."
+    )
+    return matched
+
+
 def main() -> int:
     renderer = ConsoleRenderer()
 
@@ -788,27 +1164,55 @@ def main() -> int:
             listing_service = RemoteListingService(connection.client)
             prompt_service = UserPromptService(renderer, listing_service)
 
-            # ── Paso 2: elegir carpeta ──
-            renderer.step(2, "Elegir carpeta a explorar")
-            root_entries = listing_service.list_dir(".")
-            renderer.console.print("Contenido de la raíz del servidor:")
-            renderer.console.print()
-            renderer.listing_table(root_entries)
+            # ── Paso 2: navegar a la carpeta ──
+            renderer.step(2, "Elegir carpeta a descargar")
+            renderer.console.print(
+                "Navega entre carpetas. Cuando estés en la que quieres,"
+            )
+            renderer.console.print("escribe 'd' para elegirla.")
+            remote_root = prompt_service.navigate_to_folder()
+            renderer.success(
+                f"Carpeta elegida: [bold]"
+                f"{'/' if remote_root == '.' else remote_root}[/]"
+            )
+
+            # ── Paso 3: elegir rango de fechas ──
+            renderer.step(3, "Elegir rango de fechas")
+            display_root = "/" if remote_root == "." else remote_root
+            renderer.console.print(
+                "Vamos a descargar todos los archivos dentro de"
+            )
+            renderer.console.print(
+                f'"[bold]{display_root}[/]" (incluyendo subcarpetas) que'
+            )
+            renderer.console.print(
+                "fueron subidos al servidor entre las fechas que indiques."
+            )
             renderer.console.print()
 
-            remote_root = prompt_service.ask_relative_path()
-
-            renderer.info("Explorando subcarpetas...")
+            walker = ParallelRemoteWalker(connection, config.max_workers)
             walk_errors: list[str] = []
-            all_entries = list(
-                listing_service.walk(remote_root, errors=walk_errors)
-            )
-            files_count = sum(1 for e in all_entries if not e.is_dir)
-            dirs_count = sum(1 for e in all_entries if e.is_dir)
-            renderer.success(f"Encontrada: [bold]{remote_root}[/]")
-            renderer.info(
-                f"Contiene {dirs_count} subcarpetas y {files_count} archivos."
-            )
+            while True:
+                date_filter = prompt_service.ask_date_range()
+                walk_errors = []
+                filtered = _walk_filter_with_progress(
+                    walker,
+                    remote_root,
+                    date_filter,
+                    renderer,
+                    walk_errors,
+                )
+                if filtered:
+                    break
+                renderer.console.print()
+                renderer.warning(
+                    f"No encontramos archivos del rango "
+                    f"{date_filter.describe()} en esa carpeta."
+                )
+                if not prompt_service.confirm("¿Probar con otro rango?", default=True):
+                    renderer.goodbye()
+                    return 0
+                renderer.console.print()
 
             if walk_errors:
                 renderer.warning(
@@ -822,45 +1226,15 @@ def main() -> int:
                 if len(walk_errors) > len(shown):
                     renderer.info(f"  … y {len(walk_errors) - len(shown)} más")
 
-            if files_count == 0:
-                renderer.warning(
-                    "Esta carpeta no contiene archivos. No hay nada que descargar."
-                )
-                renderer.goodbye()
-                return 0
-
-            # ── Paso 3: elegir fecha ──
-            renderer.step(3, "Elegir fecha de los archivos")
-            renderer.console.print(
-                "Vamos a descargar todos los archivos dentro de"
-            )
-            renderer.console.print(
-                f'"[bold]{remote_root}[/]" (incluyendo subcarpetas) que'
-            )
-            renderer.console.print(
-                "fueron subidos al servidor en una fecha específica."
-            )
-            renderer.console.print()
-
-            while True:
-                date_filter = prompt_service.ask_target_date()
-                filtered = DateFilterService().apply(all_entries, date_filter)
-                if filtered:
-                    break
-                renderer.console.print()
-                renderer.warning(
-                    f"No encontramos archivos del "
-                    f"{date_filter.target_date.strftime('%d-%m-%Y')} en esa carpeta."
-                )
-                if not prompt_service.confirm("¿Probar con otra fecha?", default=True):
-                    renderer.goodbye()
-                    return 0
-                renderer.console.print()
-
             # ── Paso 4: confirmar ──
             renderer.step(4, "Confirmar descarga")
-            date_str = date_filter.target_date.strftime("%d-%m-%Y")
-            folder_basename = posixpath.basename(remote_root.rstrip("/")) or "raiz"
+            date_str = date_filter.folder_name()
+            if remote_root == ".":
+                folder_basename = "raiz"
+            else:
+                folder_basename = (
+                    posixpath.basename(remote_root.rstrip("/")) or "raiz"
+                )
             local_dest = config.local_download_root / date_str / folder_basename
             total_bytes = sum(e.size_bytes for e in filtered)
             plan = DownloadPlan(
@@ -870,7 +1244,7 @@ def main() -> int:
                 total_bytes=total_bytes,
             )
 
-            renderer.preview_panel(plan, date_filter.target_date)
+            renderer.preview_panel(plan, date_filter)
 
             # Advertencia de rutas largas en Windows.
             if sys.platform == "win32":
@@ -893,7 +1267,9 @@ def main() -> int:
 
             # ── Descargar ──
             summary = DownloadService(connection, config, renderer).run(plan)
-            renderer.summary_panel(summary, plan.local_destination)
+            renderer.summary_panel(
+                summary, plan.local_destination, walk_errors=walk_errors
+            )
             return 0 if summary.failures == 0 else 1
 
     except KeyboardInterrupt:
