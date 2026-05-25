@@ -2,12 +2,31 @@
 
 Descarga archivos de una carpeta de un servidor SFTP filtrando por fecha de subida. El script guía al usuario paso a paso por una interfaz en consola pensada para gente no técnica.
 
-## Requisitos
+## Instalación rápida (Windows)
 
-- Python **3.14** o superior
+Abre PowerShell (Windows PowerShell 5.1, PowerShell 7+ o pwsh 8) y pega:
+
+```powershell
+iex (irm https://raw.githubusercontent.com/ElIsaac/ftp_downloader_by_date/main/install.ps1)
+```
+
+El instalador:
+
+1. Detecta Python 3.9+ (te avisa si falta).
+2. Descarga el repo (ZIP, no requiere git).
+3. Crea un entorno virtual en `%LOCALAPPDATA%\sftp_downloader\.venv`.
+4. Instala/valida las dependencias.
+5. Copia `.env.example` a `.env` y te ofrece abrirlo en Notepad.
+6. Lanza el script.
+
+Para solo instalar sin ejecutar: agrega `-SkipRun` al final.
+
+## Instalación manual
+
+- Python **3.14** o superior (mínimo 3.9 funcionando)
 - Dependencias:
   ```
-  pip install paramiko python-dotenv rich
+  pip install -r requirements.txt
   ```
 
 ## Configuración
