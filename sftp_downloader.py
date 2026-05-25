@@ -35,7 +35,7 @@ from rich.progress import (
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
 
 
@@ -334,13 +334,23 @@ class RemoteListingService:
     def list_dir(self, path: str) -> list[RemoteEntry]:
         return [self._to_entry(a, path) for a in self._client.listdir_attr(path)]
 
-    def walk(self, path: str) -> Iterator[RemoteEntry]:
+    def walk(
+        self, path: str, errors: list[str] | None = None
+    ) -> Iterator[RemoteEntry]:
+        """Recorre `path` recursivamente.
+
+        Si `errors` se proporciona, los subdirectorios que no se pudieron leer
+        (típicamente PermissionError) se acumulan ahí para que el caller pueda
+        avisar al usuario.
+        """
         stack = [path]
         while stack:
             current = stack.pop()
             try:
                 attrs_list = self._client.listdir_attr(current)
             except OSError:
+                if errors is not None:
+                    errors.append(current)
                 continue
             for attr in attrs_list:
                 entry = self._to_entry(attr, current)
@@ -546,9 +556,25 @@ class ConsoleRenderer:
         return Prompt.ask(f"[bold cyan]{message}[/]", console=self.console)
 
     def confirm(self, message: str, default: bool = True) -> bool:
-        return Confirm.ask(
-            f"[bold cyan]{message}[/]", default=default, console=self.console
-        )
+        # Rich Confirm.ask sólo acepta y/n y muestra "Please enter Y or N" en
+        # cualquier otro caso. Hacemos uno propio que muestra [y/n] pero
+        # también acepta s/sí (y mayúsculas) silenciosamente.
+        default_hint = "y" if default else "n"
+        while True:
+            raw = Prompt.ask(
+                f"[bold cyan]{message}[/] [dim]\\[y/n] ({default_hint})[/]",
+                console=self.console,
+                default="",
+                show_default=False,
+            )
+            v = raw.strip().lower()
+            if v == "":
+                return default
+            if v in ("y", "yes", "s", "si", "sí"):
+                return True
+            if v in ("n", "no"):
+                return False
+            self.console.print("[yellow]  Responde con y o n.[/]")
 
 
 class UserPromptService:
@@ -773,13 +799,28 @@ def main() -> int:
             remote_root = prompt_service.ask_relative_path()
 
             renderer.info("Explorando subcarpetas...")
-            all_entries = list(listing_service.walk(remote_root))
+            walk_errors: list[str] = []
+            all_entries = list(
+                listing_service.walk(remote_root, errors=walk_errors)
+            )
             files_count = sum(1 for e in all_entries if not e.is_dir)
             dirs_count = sum(1 for e in all_entries if e.is_dir)
             renderer.success(f"Encontrada: [bold]{remote_root}[/]")
             renderer.info(
                 f"Contiene {dirs_count} subcarpetas y {files_count} archivos."
             )
+
+            if walk_errors:
+                renderer.warning(
+                    f"{len(walk_errors)} subcarpeta(s) no se pudieron leer "
+                    "(probablemente por permisos). Los archivos dentro NO se "
+                    "incluirán en la descarga."
+                )
+                shown = walk_errors[:3]
+                for p in shown:
+                    renderer.info(f"  • {p}")
+                if len(walk_errors) > len(shown):
+                    renderer.info(f"  … y {len(walk_errors) - len(shown)} más")
 
             if files_count == 0:
                 renderer.warning(
