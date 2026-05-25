@@ -1,0 +1,26 @@
+# Secretos — nunca subir credenciales
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Descargas locales (por si alguien apunta LOCAL_DOWNLOAD_ROOT acá)
+downloads/
+sftp_pulls/
